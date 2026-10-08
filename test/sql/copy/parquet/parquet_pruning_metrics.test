@@ -141,3 +141,48 @@ EXPLAIN ANALYZE SELECT sum(a) FROM read_parquet(['{TEST_DIR}/prune_multi_a.parqu
     WHERE a >= 92160
 ----
 analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Statistics\): 18.*
+
+# ---------------------------------------------------------------------------
+# Counters are complete regardless of thread count
+# ---------------------------------------------------------------------------
+
+# Page counters are raised while scanning, not while scheduling, so they are only safe once handed over:
+# a reader released by one thread must not drop what another thread counted.
+statement ok
+COPY (SELECT range AS a, 'v' || (range % 8)::VARCHAR AS s FROM range(1024000))
+    TO '{TEST_DIR}/prune_mt.parquet' (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+statement ok
+SET threads=4
+
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_mt.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Dictionary\): 100.*
+
+statement ok
+SET threads=8
+
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_mt.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Dictionary\): 100.*
+
+# across several files too
+statement ok
+COPY (SELECT range AS a, 'v' || (range % 8)::VARCHAR AS s FROM range(512000))
+    TO '{TEST_DIR}/prune_mt_a.parquet' (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+statement ok
+COPY (SELECT range AS a, 'v' || (range % 8)::VARCHAR AS s FROM range(512000))
+    TO '{TEST_DIR}/prune_mt_b.parquet' (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+query II
+EXPLAIN ANALYZE SELECT sum(a)
+FROM read_parquet(['{TEST_DIR}/prune_mt_a.parquet', '{TEST_DIR}/prune_mt_b.parquet'])
+WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Dictionary\): 100.*
+
+statement ok
+SET threads=1
