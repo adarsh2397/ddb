@@ -43,6 +43,13 @@ public:
 		child_column_reader->RegisterPrefetch(transport, allow_merge);
 	}
 
+	void ForEachReader(const std::function<void(ColumnReader &)> &callback) override {
+		callback(*this);
+		if (child_column_reader) {
+			child_column_reader->ForEachReader(callback);
+		}
+	}
+
 protected:
 	template <class OP>
 	idx_t ReadInternal(ColumnReaderInput &input, optional_ptr<Vector> result_out);

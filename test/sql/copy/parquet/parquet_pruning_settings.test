@@ -1,0 +1,215 @@
+# name: test/sql/copy/parquet/parquet_pruning_settings.test
+# description: Settings that disable each Parquet pruning mechanism, to measure what it contributes
+# group: [parquet]
+
+require parquet
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+SET threads=1
+
+statement ok
+COPY (SELECT range AS a FROM range(102400)) TO '{TEST_DIR}/gate_stats.parquet'
+    (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+# every row group spans the full [0, 990] range, so only the bloom filter can exclude 201
+statement ok
+COPY (SELECT ((range * 10) % 1000)::BIGINT AS r FROM range(100000))
+    TO '{TEST_DIR}/gate_bloom.parquet' (ROW_GROUP_SIZE 10000)
+
+statement ok
+COPY (SELECT 'v' || (range % 8)::VARCHAR AS s, range AS a FROM range(40960))
+    TO '{TEST_DIR}/gate_dict.parquet' (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+# ---------------------------------------------------------------------------
+# All four default to false, so pruning is on unless it is opted out of
+# ---------------------------------------------------------------------------
+
+query IIII
+SELECT current_setting('disable_parquet_row_group_statistics_pruning')::BOOLEAN,
+       current_setting('disable_parquet_bloom_filter_pruning')::BOOLEAN,
+       current_setting('disable_parquet_page_statistics_pruning')::BOOLEAN,
+       current_setting('disable_parquet_dictionary_pruning')::BOOLEAN
+----
+false	false	false	false
+
+# ---------------------------------------------------------------------------
+# Row group statistics
+# ---------------------------------------------------------------------------
+
+statement ok
+SET disable_parquet_row_group_statistics_pruning=true
+
+# the mechanism is off, so nothing is pruned and every row group is scanned
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Scanned: 10 / 10.*
+
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<!REGEX>:(?s).*Row Groups Pruned \(Statistics\).*
+
+# the result is unchanged - this is an optimization, not a semantic
+query I
+SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+996142080
+
+statement ok
+RESET disable_parquet_row_group_statistics_pruning
+
+query I
+SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+996142080
+
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Statistics\): 9.*
+
+# ---------------------------------------------------------------------------
+# Bloom filter
+# ---------------------------------------------------------------------------
+
+statement ok
+SET disable_parquet_bloom_filter_pruning=true
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<!REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\).*
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+0
+
+# turning the bloom filter off does not make the statistics prune in its place: 201 is inside every
+# row group's min/max, so with the bloom filter gone nothing can exclude them
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Scanned: 10 / 10.*
+
+statement ok
+RESET disable_parquet_bloom_filter_pruning
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\): 10.*
+
+# disabling the row group statistics leaves the bloom filter working, and vice versa
+statement ok
+SET disable_parquet_row_group_statistics_pruning=true
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\): 10.*
+
+statement ok
+RESET disable_parquet_row_group_statistics_pruning
+
+# ---------------------------------------------------------------------------
+# Dictionary
+# ---------------------------------------------------------------------------
+
+statement ok
+SET disable_parquet_dictionary_pruning=true
+
+query II
+EXPLAIN ANALYZE SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<!REGEX>:(?s).*Pages Pruned \(Dictionary\).*
+
+# a dictionary encoded page is never considered for page statistics pruning, so turning the dictionary
+# off does not hand the work to the page statistics - no page is pruned at all
+query II
+EXPLAIN ANALYZE SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<!REGEX>:(?s).*Pages Pruned.*
+
+# results are unchanged with the dictionary filter pushdown disabled
+query I
+SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3zzz'
+----
+0
+
+query I
+SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3'
+----
+5120
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s IN ('v1', 'v5')
+----
+10240
+
+statement ok
+RESET disable_parquet_dictionary_pruning
+
+query II
+EXPLAIN ANALYZE SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Dictionary\): \d+.*
+
+# ---------------------------------------------------------------------------
+# Page statistics
+# ---------------------------------------------------------------------------
+
+# DuckDB's Parquet writer never sets DataPageHeader.statistics (see PrimitiveColumnWriter), and no file in
+# data/ carries page statistics either, so this mechanism cannot be exercised from this test suite. It fires
+# only on files from writers that do emit them. The setting is still asserted to be settable and to preserve
+# results, so the gate itself is covered.
+statement ok
+SET disable_parquet_page_statistics_pruning=true
+
+query I
+SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+996142080
+
+statement ok
+RESET disable_parquet_page_statistics_pruning
+
+# ---------------------------------------------------------------------------
+# All four disabled at once still returns identical results
+# ---------------------------------------------------------------------------
+
+statement ok
+SET disable_parquet_row_group_statistics_pruning=true
+
+statement ok
+SET disable_parquet_bloom_filter_pruning=true
+
+statement ok
+SET disable_parquet_page_statistics_pruning=true
+
+statement ok
+SET disable_parquet_dictionary_pruning=true
+
+query I
+SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+996142080
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/gate_bloom.parquet' WHERE r = 201
+----
+0
+
+query I
+SELECT count(a) FROM '{TEST_DIR}/gate_dict.parquet' WHERE s = 'v3'
+----
+5120
+
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/gate_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<!REGEX>:(?s).*Pruned.*

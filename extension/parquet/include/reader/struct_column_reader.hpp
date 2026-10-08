@@ -35,6 +35,17 @@ public:
 	idx_t GroupRowsAvailable() override;
 	uint64_t TotalCompressedSize() override;
 	void RegisterPrefetch(ThriftFileTransport &transport, bool allow_merge) override;
+
+	void ForEachReader(const std::function<void(ColumnReader &)> &callback) override {
+		callback(*this);
+		for (auto &child : child_readers) {
+			// an unprojected struct field has no reader
+			if (!child) {
+				continue;
+			}
+			child->ForEachReader(callback);
+		}
+	}
 };
 
 } // namespace duckdb

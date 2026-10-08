@@ -157,6 +157,9 @@ bool DictionaryDecoder::DictionarySupportsFilter(const TableFilter &filter, Tabl
 }
 
 bool DictionaryDecoder::CanFilter(const TableFilter &filter, TableFilterState &filter_state) {
+	if (!reader.PruningConfig().dictionary) {
+		return false;
+	}
 	if (dictionary_size == 0) {
 		return false;
 	}

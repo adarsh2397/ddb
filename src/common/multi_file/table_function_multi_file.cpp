@@ -27,6 +27,8 @@ public:
 	mutex metrics_lock;
 	idx_t collected_scanned = 0;
 	idx_t collected_total = 0;
+	//! Counters the wrapped function reported, summed over the files of this scan and handed over once
+	InsertionOrderPreservingMap<idx_t> collected_counters;
 };
 
 class TableFunctionMultiFileLocalState : public LocalTableFunctionState {
@@ -196,6 +198,15 @@ void TableFunctionFileReader::CollectMetrics(ClientContext &context, GlobalTable
 	// the function reports the size of its file as a whole - only add what it has grown by since we last asked
 	gstate.collected_total += file_metrics.total_row_groups_to_scan - collected_file_total;
 	collected_file_total = file_metrics.total_row_groups_to_scan;
+	// counters are drained by the function, so they are summed across the files rather than overwritten
+	for (auto &entry : file_metrics.GetExtraCounters()) {
+		auto existing = gstate.collected_counters.find(entry.first);
+		if (existing == gstate.collected_counters.end()) {
+			gstate.collected_counters.insert(entry.first, entry.second);
+		} else {
+			existing->second += entry.second;
+		}
+	}
 }
 
 void TableFunctionFileReader::FinishFile(ClientContext &context, GlobalTableFunctionState &gstate) {
@@ -745,6 +756,11 @@ static void TableFunctionMultiFileGetMetrics(TableFunctionGetMetricsInput &input
 	// the row groups scanned are handed over once - the profiler sums what every thread reports
 	input.operator_metrics.row_groups_scanned += scan_state.collected_scanned;
 	scan_state.collected_scanned = 0;
+	// like "scanned", these are handed over exactly once - the profiler sums what each thread reports
+	for (auto &entry : scan_state.collected_counters) {
+		input.operator_metrics.AddExtraCounter(entry.first, entry.second);
+	}
+	scan_state.collected_counters.clear();
 	// the size of the scan is reported as-is - it is not summed across the threads that report it
 	input.operator_metrics.total_row_groups_to_scan = scan_state.collected_total;
 }

@@ -53,6 +53,7 @@
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "parquet_column_schema.hpp"
+#include "parquet_pruning.hpp"
 #include "thrift/protocol/TProtocol.h"
 #include "reader/string_column_reader.hpp"
 
@@ -242,6 +243,8 @@ public:
 	//! profiling metrics (the profiler sums them across threads).
 	idx_t row_groups_read = 0;
 	idx_t row_groups_skipped = 0;
+	//! Per-thread pruning counters, drained into the global state alongside the row group counts
+	ParquetPruningCounters pruning_counters;
 
 	//! Prefetch cost model
 	PrefetchCostModelState cost_model_state;
@@ -456,7 +459,8 @@ private:
 	idx_t GetGroupOffset(ParquetReaderScanState &state);
 	//! Group span is the distance between the min page offset and the max page offset plus the max page compressed size
 	uint64_t GetGroupSpan(ParquetReaderScanState &state);
-	void PrepareRowGroupBuffer(ClientContext &context, ParquetReaderScanState &state, idx_t out_col_idx);
+	ParquetRowGroupPruneReason PrepareRowGroupBuffer(ClientContext &context, ParquetReaderScanState &state,
+	                                                 idx_t out_col_idx, const ParquetPruningConfig &pruning);
 	//! Whole-group prefetch strategy.
 	ParquetPrefetchStrategy WholeGroupPrefetch(ParquetReaderScanState &state, ThriftFileTransport &trans,
 	                                           const duckdb_parquet::RowGroup &group, uint64_t total_row_group_span,

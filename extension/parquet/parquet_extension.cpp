@@ -1110,6 +1110,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "parquet_prefetch_column_gap",
 	    "Byte gap under which Parquet prefetch I/O ranges are coalesced (NULL lets the cost model adapt it)",
 	    LogicalType::UBIGINT, Value(LogicalType::UBIGINT));
+	config.AddExtensionOption("disable_parquet_row_group_statistics_pruning",
+	                          "Disable skipping Parquet row groups using their min/max statistics",
+	                          LogicalType::BOOLEAN, Value(false));
+	config.AddExtensionOption("disable_parquet_bloom_filter_pruning",
+	                          "Disable skipping Parquet row groups using their bloom filters", LogicalType::BOOLEAN,
+	                          Value(false));
+	config.AddExtensionOption("disable_parquet_page_statistics_pruning",
+	                          "Disable skipping Parquet data pages using the statistics in their page headers",
+	                          LogicalType::BOOLEAN, Value(false));
+	config.AddExtensionOption("disable_parquet_dictionary_pruning",
+	                          "Disable pushing filters into Parquet dictionary pages, which both skips pages whose "
+	                          "dictionary has no matching value and evaluates the filter against the dictionary "
+	                          "rather than against every row",
+	                          LogicalType::BOOLEAN, Value(false));
 	config.AddExtensionOption("parquet_metadata_cache",
 	                          "Cache Parquet metadata - useful when reading the same files multiple times",
 	                          LogicalType::BOOLEAN, Value(false));

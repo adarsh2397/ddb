@@ -1,0 +1,143 @@
+# name: test/sql/copy/parquet/parquet_pruning_metrics.test
+# description: Pruning counters attribute row group and page skips to the mechanism that caused them
+# group: [parquet]
+
+require parquet
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+# single-threaded so the counters are deterministic
+statement ok
+SET threads=1
+
+# ---------------------------------------------------------------------------
+# Row groups pruned by min/max statistics
+# ---------------------------------------------------------------------------
+
+# 10 row groups of 10240 rows, no bloom filter, so only the statistics can prune
+statement ok
+COPY (SELECT range AS a FROM range(102400)) TO '{TEST_DIR}/prune_stats.parquet'
+    (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+# a >= 92160 is the last row group: the other 9 are excluded by their min/max
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Statistics\): 9.*
+
+# the bloom filter pruned nothing, so its key is left out entirely
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<!REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\).*
+
+# a scan that prunes nothing reports no pruning keys at all
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_stats.parquet'
+----
+analyzed_plan	<!REGEX>:(?s).*Pruned.*
+
+# the two row group counters account for every skipped row group
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM '{TEST_DIR}/prune_stats.parquet' WHERE a >= 92160
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Scanned: 1 / 10.*
+
+# ---------------------------------------------------------------------------
+# Row groups pruned by the bloom filter
+# ---------------------------------------------------------------------------
+
+# every row group cycles through all of 0, 10, ... 990, so each spans the full [0, 990] range and the
+# statistics can exclude nothing. 201 is inside that range but in no row group, so only the bloom filter can
+statement ok
+COPY (SELECT ((range * 10) % 1000)::BIGINT AS r FROM range(100000))
+    TO '{TEST_DIR}/prune_bloom.parquet' (ROW_GROUP_SIZE 10000)
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/prune_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\): 10.*
+
+# the statistics pruned nothing here, so only the bloom filter is reported
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/prune_bloom.parquet' WHERE r = 201
+----
+analyzed_plan	<!REGEX>:(?s).*Row Groups Pruned \(Statistics\).*
+
+# ---------------------------------------------------------------------------
+# When both mechanisms could exclude a row group, it is attributed to the statistics
+# ---------------------------------------------------------------------------
+
+# sorted, so each row group holds a narrow range: the statistics exclude 9 of the 10 on their own and
+# the bloom filter is what excludes the one row group whose [min, max] contains 201
+statement ok
+COPY (SELECT (r1.range*10)::BIGINT r FROM range(100) r1, range(1000) ORDER BY r)
+    TO '{TEST_DIR}/prune_both.parquet' (ROW_GROUP_SIZE 10000)
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/prune_both.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Statistics\): 9.*
+
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/prune_both.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Bloom Filter\): 1.*
+
+# the two counters account for every one of the 10 skipped row groups
+query II
+EXPLAIN ANALYZE SELECT sum(r) FROM '{TEST_DIR}/prune_both.parquet' WHERE r = 201
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Scanned: 0 / 10.*
+
+# ---------------------------------------------------------------------------
+# Pages pruned by the dictionary
+# ---------------------------------------------------------------------------
+
+# a low-cardinality string column is dictionary encoded; the row group statistics cannot exclude a value
+# that sorts inside [min, max], so the dictionary is what skips the pages
+statement ok
+COPY (SELECT 'v' || (range % 8)::VARCHAR AS s, range AS a FROM range(40960))
+    TO '{TEST_DIR}/prune_dict.parquet' (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+query II
+EXPLAIN ANALYZE SELECT count(a) FROM '{TEST_DIR}/prune_dict.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Dictionary\): \d+.*
+
+# pruned pages carry the compressed bytes that were not decoded
+query II
+EXPLAIN ANALYZE SELECT count(a) FROM '{TEST_DIR}/prune_dict.parquet' WHERE s = 'v3zzz'
+----
+analyzed_plan	<REGEX>:(?s).*Pages Pruned \(Bytes\): \d+.*
+
+# the filter still returns the right answer
+query I
+SELECT count(a) FROM '{TEST_DIR}/prune_dict.parquet' WHERE s = 'v3zzz'
+----
+0
+
+query I
+SELECT count(a) FROM '{TEST_DIR}/prune_dict.parquet' WHERE s = 'v3'
+----
+5120
+
+# ---------------------------------------------------------------------------
+# Multi-file scans sum the counters across their files
+# ---------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT range AS a FROM range(102400)) TO '{TEST_DIR}/prune_multi_a.parquet'
+    (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+statement ok
+COPY (SELECT range AS a FROM range(102400)) TO '{TEST_DIR}/prune_multi_b.parquet'
+    (ROW_GROUP_SIZE 10240, WRITE_BLOOM_FILTER FALSE)
+
+# 9 row groups pruned in each of the two files
+query II
+EXPLAIN ANALYZE SELECT sum(a) FROM read_parquet(['{TEST_DIR}/prune_multi_a.parquet', '{TEST_DIR}/prune_multi_b.parquet'])
+    WHERE a >= 92160
+----
+analyzed_plan	<REGEX>:(?s).*Row Groups Pruned \(Statistics\): 18.*

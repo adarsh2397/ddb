@@ -218,6 +218,25 @@ CreateThriftFileProtocol(QueryContext context, CachingFileHandle &file_handle, b
 	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<ThriftFileTransport>>(std::move(transport));
 }
 
+//! Which pruning mechanisms are enabled - each can be turned off to measure what it contributes
+static ParquetPruningConfig GetPruningConfig(ClientContext &context) {
+	ParquetPruningConfig result;
+	bool disabled = false;
+	if (context.TryGetCurrentSetting("disable_parquet_row_group_statistics_pruning", disabled)) {
+		result.row_group_statistics = !disabled;
+	}
+	if (context.TryGetCurrentSetting("disable_parquet_bloom_filter_pruning", disabled)) {
+		result.bloom_filter = !disabled;
+	}
+	if (context.TryGetCurrentSetting("disable_parquet_page_statistics_pruning", disabled)) {
+		result.page_statistics = !disabled;
+	}
+	if (context.TryGetCurrentSetting("disable_parquet_dictionary_pruning", disabled)) {
+		result.dictionary = !disabled;
+	}
+	return result;
+}
+
 static bool ShouldAndCanPrefetch(ClientContext &context, CachingFileHandle &file_handle) {
 	bool disable_prefetch = false;
 	context.TryGetCurrentSetting("disable_parquet_prefetching", disable_prefetch);
@@ -1686,10 +1705,13 @@ ColumnReader &ParquetReaderScanState::GetColumnReader(idx_t i) {
 	return *column_readers[i];
 }
 
-void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderScanState &state, idx_t i) {
+ParquetRowGroupPruneReason ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderScanState &state,
+                                                                idx_t i, const ParquetPruningConfig &pruning) {
 	auto &group = GetGroup(state);
 	auto col_idx = MultiFileLocalIndex(i);
 	auto &column_reader = state.GetColumnReader(col_idx);
+	// the page-level mechanisms run without a ClientContext, so hand them the configuration here
+	column_reader.SetPruningConfig(pruning);
 
 	// keep track of column and row group ordinal if data is encrypted
 	if (metadata->crypto_metadata && metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_CTR_V1) {
@@ -1714,7 +1736,10 @@ void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderS
 			auto prune_result = FilterPropagateResult::NO_PRUNING_POSSIBLE;
 			bool is_generated_column = schema_column_index >= group.columns.size();
 			bool is_expression = column_reader.Schema().schema_type == ParquetColumnSchemaType::EXPRESSION;
-			auto stats = column_reader.Stats(state.group_index, group.columns);
+			unique_ptr<BaseStatistics> stats;
+			if (pruning.row_group_statistics) {
+				stats = column_reader.Stats(state.group_index, group.columns);
+			}
 			if (stats) {
 				bool has_min_max = false;
 				if (!is_generated_column) {
@@ -1737,8 +1762,18 @@ void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderS
 					prune_result = expr_filter.CheckStatistics(context, *stats);
 				}
 			}
+			// a row group excluded by the statistics above is attributed to them, even if the bloom filter agrees.
+			// only an exclusion counts - the statistics can also report that every row matches
+			const bool stats_excluded = prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE ||
+			                            prune_result == FilterPropagateResult::FILTER_FALSE_OR_NULL;
+			auto prune_reason =
+			    stats_excluded ? ParquetRowGroupPruneReason::STATISTICS : ParquetRowGroupPruneReason::NONE;
+
 			// check the bloom filter if present
-			auto bloom_source = TryGetBloomFilterSource(column_reader);
+			optional_ptr<ColumnReader> bloom_source;
+			if (pruning.bloom_filter) {
+				bloom_source = TryGetBloomFilterSource(column_reader);
+			}
 			if (bloom_source) {
 				optional_ptr<ColumnReader> bloom_reader = bloom_source;
 				optional_ptr<const TableFilter> bloom_filter = &filter;
@@ -1762,6 +1797,9 @@ void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderS
 				        *bloom_filter, group.columns[bloom_reader->ColumnIndex()].meta_data, *state.thrift_file_proto,
 				        allocator, bloom_reader->Schema(), *hash_strategy)) {
 					prune_result = FilterPropagateResult::FILTER_ALWAYS_FALSE;
+					if (prune_reason == ParquetRowGroupPruneReason::NONE) {
+						prune_reason = ParquetRowGroupPruneReason::BLOOM_FILTER;
+					}
 				}
 			}
 
@@ -1770,12 +1808,13 @@ void ParquetReader::PrepareRowGroupBuffer(ClientContext &context, ParquetReaderS
 				// this effectively will skip this chunk - count the skipped rows towards the progress
 				rows_read += row_group_num_rows - state.offset_in_group;
 				state.offset_in_group = group.num_rows;
-				return;
+				return prune_reason;
 			}
 		}
 	}
 
 	column_reader.InitializeRead(state.group_index, row_group_num_rows, group.columns, *state.thrift_file_proto);
+	return ParquetRowGroupPruneReason::NONE;
 }
 
 idx_t ParquetReader::NumRows() const {
@@ -2117,10 +2156,19 @@ ParquetPrefetchStrategy ParquetReader::RegisterRowGroupReads(ClientContext &cont
 	// TODO: only need this if we have a deletion vector?
 	state.group_offset = GetRowGroupOffset(*this, state.group_index);
 
+	// read once per row group so that a SET takes effect without rebinding, and so that nothing is shared across
+	// threads - the cost is immaterial next to reading a row group
+	const auto pruning = GetPruningConfig(context);
+
 	uint64_t to_scan_compressed_bytes = 0;
+	auto prune_reason = ParquetRowGroupPruneReason::NONE;
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		auto col_idx = MultiFileLocalIndex(i);
-		PrepareRowGroupBuffer(context, state, col_idx);
+		auto column_reason = PrepareRowGroupBuffer(context, state, col_idx, pruning);
+		if (prune_reason == ParquetRowGroupPruneReason::NONE) {
+			// the first column that excluded the row group is the one it is attributed to
+			prune_reason = column_reason;
+		}
 		to_scan_compressed_bytes += state.GetColumnReader(i).TotalCompressedSize();
 	}
 
@@ -2128,6 +2176,16 @@ ParquetPrefetchStrategy ParquetReader::RegisterRowGroupReads(ClientContext &cont
 	const bool row_group_skipped = state.offset_in_group == (idx_t)group.num_rows;
 	if (row_group_skipped) {
 		++state.row_groups_skipped;
+		switch (prune_reason) {
+		case ParquetRowGroupPruneReason::STATISTICS:
+			state.pruning_counters.row_groups_pruned_stats++;
+			break;
+		case ParquetRowGroupPruneReason::BLOOM_FILTER:
+			state.pruning_counters.row_groups_pruned_bloom++;
+			break;
+		default:
+			break;
+		}
 	} else {
 		++state.row_groups_read;
 	}
@@ -2212,6 +2270,12 @@ AsyncResult ParquetReader::ScheduleRowGroupReads(ParquetReaderScanState &state, 
 void ParquetReader::FinishRowGroup(ClientContext &context, ParquetReaderScanState &state, bool log_prefetch) {
 	if (log_prefetch && state.prefetch_metrics.filter_ran) {
 		LogRowGroupPrefetch(context, file.path, state.group_index, state);
+	}
+	// fold the page counters the column readers accumulated for this row group (children included) into the scan
+	for (auto &column_reader : state.column_readers) {
+		if (column_reader) {
+			column_reader->CollectPruningCounters(state.pruning_counters);
+		}
 	}
 	state.prefetch_metrics.FinalizeRowGroupSelectivity();
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*state.thrift_file_proto->getTransport());

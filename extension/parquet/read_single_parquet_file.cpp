@@ -403,6 +403,15 @@ ReadSingleParquetFileStatistics(ClientContext &context, const FunctionData *bind
 	                                     parquet_data.parquet_names[column_index]);
 }
 
+//! Hand one drained pruning counter to the profiler, leaving out mechanisms that pruned nothing
+static void ReportPruningCounter(OperatorMetrics &metrics, const char *key, atomic<idx_t> &counter) {
+	auto value = counter.exchange(0);
+	if (value == 0) {
+		return;
+	}
+	metrics.AddExtraCounter(key, value);
+}
+
 //! The row groups read from this file. The counts accumulate, so that a scan over several files reports their sum
 static void ReadSingleParquetFileGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (!input.global_state) {
@@ -413,6 +422,18 @@ static void ReadSingleParquetFileGetMetrics(TableFunctionGetMetricsInput &input)
 	// which our caller reports as-is
 	input.operator_metrics.row_groups_scanned += gstate.state.row_groups_scanned_unreported.exchange(0);
 	input.operator_metrics.total_row_groups_to_scan += gstate.state.total_row_groups_to_scan.load();
+
+	// the pruning counters are drained too, so a scan over several files reports their sum; zero-valued mechanisms
+	// are left out so that a scan which prunes nothing reads exactly as it did before
+	auto &metrics = input.operator_metrics;
+	auto &state = gstate.state;
+	ReportPruningCounter(metrics, "Row Groups Pruned (Statistics)", state.row_groups_pruned_stats);
+	ReportPruningCounter(metrics, "Row Groups Pruned (Bloom Filter)", state.row_groups_pruned_bloom);
+	ReportPruningCounter(metrics, "Pages Pruned (Statistics)", state.pages_pruned_stats);
+	ReportPruningCounter(metrics, "Pages Pruned (Dictionary)", state.pages_pruned_dictionary);
+	ReportPruningCounter(metrics, "Pages Pruned (Bytes)", state.pages_pruned_bytes);
+	ReportPruningCounter(metrics, "Pages Pruned After Fetch", state.pages_pruned_after_fetch);
+	ReportPruningCounter(metrics, "Pages Pruned After Fetch (Bytes)", state.pages_pruned_after_fetch_bytes);
 }
 
 //! The row groups of this file, read from its metadata

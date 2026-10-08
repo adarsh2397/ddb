@@ -87,6 +87,16 @@ public:
 		}
 	}
 
+	void ForEachReader(const std::function<void(ColumnReader &)> &callback) override {
+		callback(*this);
+		for (auto &child_reader : child_readers) {
+			if (!child_reader) {
+				continue;
+			}
+			child_reader->ForEachReader(callback);
+		}
+	}
+
 private:
 	ClientContext &context;
 	void InitializeChunk();

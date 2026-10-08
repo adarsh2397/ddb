@@ -468,6 +468,9 @@ void OperatorMetrics::MergeInternal(const OperatorMetrics &other) {
 	if (other.system_peak_temp_directory_size > system_peak_temp_directory_size) {
 		system_peak_temp_directory_size = other.system_peak_temp_directory_size;
 	}
+	for (auto &entry : other.extra_counters) {
+		AddExtraCounter(entry.first, entry.second);
+	}
 }
 
 void OperatorMetrics::Accumulate(const OperatorMetrics &other) {
@@ -562,6 +565,8 @@ void QueryProfiler::Flush(OperatorProfiler &profiler) {
 		if (!node.second.GetExtraInfo().empty()) {
 			info.SetExtraInfo(node.second.GetExtraInfo());
 		}
+		// after SetExtraInfo, which replaces what was rendered on an earlier flush
+		info.MaterializeExtraCounters();
 
 		if (node.second.system_peak_buffer_manager_memory > query_metrics.system_peak_buffer_memory) {
 			query_metrics.system_peak_buffer_memory = node.second.system_peak_buffer_manager_memory;

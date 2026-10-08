@@ -25,6 +25,7 @@
 #include "decoder/delta_length_byte_array_decoder.hpp"
 #include "decoder/delta_byte_array_decoder.hpp"
 #include "parquet_column_schema.hpp"
+#include "parquet_pruning.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/string_type.hpp"
@@ -120,6 +121,25 @@ public:
 	static void ApplyFilter(Vector &v, const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
 	                        SelectionVector &sel, idx_t &approved_tuple_count);
 	virtual void Skip(idx_t num_values);
+
+	//! Apply a callback to this reader and, for composite readers, every reader below it
+	virtual void ForEachReader(const std::function<void(ColumnReader &)> &callback) {
+		callback(*this);
+	}
+	//! Fold this reader's pruning counters (and those of its children) into the target, resetting them
+	void CollectPruningCounters(ParquetPruningCounters &target) {
+		ForEachReader([&target](ColumnReader &reader) {
+			target.Add(reader.pruning_counters);
+			reader.pruning_counters.Reset();
+		});
+	}
+	const ParquetPruningConfig &PruningConfig() const {
+		return pruning_config;
+	}
+	//! Set the pruning configuration on this reader and every reader below it
+	void SetPruningConfig(const ParquetPruningConfig &config) {
+		ForEachReader([&config](ColumnReader &reader) { reader.pruning_config = config; });
+	}
 
 	const ParquetReader &Reader();
 	const LogicalType &Type() const {
@@ -372,7 +392,14 @@ protected:
 	const ParquetReader &reader;
 	idx_t pending_skips = 0;
 	bool page_is_filtered_out = false;
+	//! Which pruning mechanisms are enabled, set per row group by the scan
+	ParquetPruningConfig pruning_config;
 
+public:
+	//! Per-thread page pruning counters, collected after each row group
+	ParquetPruningCounters pruning_counters;
+
+protected:
 	virtual void ResetPage();
 
 private:

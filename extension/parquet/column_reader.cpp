@@ -283,13 +283,18 @@ bool ColumnReader::PageIsFilteredOut(PageHeader &page_hdr, optional_ptr<const Ta
 	auto &v2_header = page_hdr.data_page_header_v2;
 	auto page_encoding = is_v1 ? v1_header.encoding : v2_header.encoding;
 
+	// note the dictionary and page-statistics mechanisms are mutually exclusive: a dictionary-encoded page is never
+	// considered for page-statistics pruning, and vice versa
+	bool pruned_by_dictionary = false;
 	if (page_encoding == Encoding::PLAIN_DICTIONARY || page_encoding == Encoding::RLE_DICTIONARY) {
+		// DictionaryDecoder::CanFilter gates this - with dictionary pruning disabled no values are ever filtered out
 		if (!dictionary_decoder.HasFilteredOutAllValues()) {
 			return false;
 		}
 		encoding = ColumnEncoding::DICTIONARY;
 		page_is_filtered_out = true;
-	} else if (filter) {
+		pruned_by_dictionary = true;
+	} else if (filter && pruning_config.page_statistics) {
 		// try to use page statistics to skip this page if could.
 		const duckdb_parquet::Statistics *page_stats = nullptr;
 		if (is_v1 && v1_header.__isset.statistics) {
@@ -317,7 +322,20 @@ bool ColumnReader::PageIsFilteredOut(PageHeader &page_hdr, optional_ptr<const Ta
 		// the page has been filtered out!
 		// skip forward
 		auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
-		trans.Skip(page_hdr.compressed_page_size);
+		auto compressed_page_size = NumericCast<idx_t>(page_hdr.compressed_page_size);
+		if (pruned_by_dictionary) {
+			pruning_counters.pages_pruned_dictionary++;
+		} else {
+			pruning_counters.pages_pruned_stats++;
+		}
+		pruning_counters.pages_pruned_bytes += compressed_page_size;
+		// the page header is read from the data stream, so without a page index the bytes are usually already here:
+		// skipping them saves decoding, but no I/O
+		if (trans.RangeIsBuffered(trans.GetLocation(), compressed_page_size)) {
+			pruning_counters.pages_pruned_after_fetch++;
+			pruning_counters.pages_pruned_after_fetch_bytes += compressed_page_size;
+		}
+		trans.Skip(compressed_page_size);
 		page_rows_available = is_v1 ? v1_header.num_values : v2_header.num_values;
 	}
 

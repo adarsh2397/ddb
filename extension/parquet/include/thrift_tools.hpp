@@ -255,6 +255,12 @@ public:
 		return ra_buffer.GetReadHead(pos);
 	}
 
+	//! Whether the given range has already been fetched into a prefetch buffer, i.e. skipping it saves no I/O
+	bool RangeIsBuffered(idx_t pos, idx_t len) {
+		auto read_head = ra_buffer.GetReadHead(pos);
+		return read_head && read_head->data_isset && pos + len <= read_head->GetEnd();
+	}
+
 	vector<shared_ptr<ReadHead>> &GetReadHeads() {
 		return ra_buffer.read_heads;
 	}

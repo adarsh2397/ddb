@@ -47,6 +47,16 @@ public:
 	void PrepareChunk(DataChunk &chunk, idx_t &capacity, const vector<LogicalType> &types, idx_t count);
 	uint64_t TotalCompressedSize() override;
 	void RegisterPrefetch(ThriftFileTransport &transport, bool allow_merge) override;
+
+	void ForEachReader(const std::function<void(ColumnReader &)> &callback) override {
+		callback(*this);
+		for (auto &child : child_readers) {
+			if (!child) {
+				continue;
+			}
+			child->ForEachReader(callback);
+		}
+	}
 	static bool TypedValueLayoutToType(const LogicalType &typed_value, LogicalType &logical_type);
 
 protected:

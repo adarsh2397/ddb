@@ -32,6 +32,7 @@ struct OperatorMetrics {
 
 	profiler_metrics_t GetMetrics(const GatheredMetrics &info) const;
 	void ResetMetrics() {
+		extra_counters.clear();
 		time = 0;
 		elements_returned = 0;
 		intermediate_size_bytes = 0;
@@ -46,6 +47,25 @@ struct OperatorMetrics {
 	void AddExtraInfo(string key, string value) {
 		extra_info.insert(make_pair(std::move(key), std::move(value)));
 	}
+	//! Like AddExtraInfo, but for a count that must be summed when several sources report the same key
+	void AddExtraCounter(const string &key, idx_t value) {
+		auto entry = extra_counters.find(key);
+		if (entry == extra_counters.end()) {
+			extra_counters.insert(make_pair(key, value));
+			return;
+		}
+		entry->second += value;
+	}
+	const InsertionOrderPreservingMap<idx_t> &GetExtraCounters() const {
+		return extra_counters;
+	}
+	//! Render the counters into extra_info, so they are reported like any other per-operator key/value.
+	//! The counters are kept, so that repeating this as more is reported overwrites with the running total
+	void MaterializeExtraCounters() {
+		for (auto &entry : extra_counters) {
+			extra_info[entry.first] = to_string(entry.second);
+		}
+	}
 	void SetExtraInfo(InsertionOrderPreservingMap<string> info) {
 		extra_info = std::move(info);
 	}
@@ -58,6 +78,8 @@ struct OperatorMetrics {
 
 private:
 	InsertionOrderPreservingMap<string> extra_info;
+	//! Summable counters, materialized into extra_info once every source has reported
+	InsertionOrderPreservingMap<idx_t> extra_counters;
 	void MergeInternal(const OperatorMetrics &other);
 };
 

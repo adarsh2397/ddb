@@ -62,6 +62,29 @@ struct ParquetReadGlobalState : public GlobalTableFunctionState {
 	atomic<idx_t> row_groups_scanned_unreported {0};
 	//! Total considered, across all scan states
 	atomic<idx_t> total_row_groups_to_scan {0};
+	//! Pruning counters drained from the scan states, not yet reported to the profiler
+	atomic<idx_t> row_groups_pruned_stats {0};
+	atomic<idx_t> row_groups_pruned_bloom {0};
+	atomic<idx_t> pages_pruned_stats {0};
+	atomic<idx_t> pages_pruned_dictionary {0};
+	atomic<idx_t> pages_pruned_bytes {0};
+	atomic<idx_t> pages_pruned_after_fetch {0};
+	atomic<idx_t> pages_pruned_after_fetch_bytes {0};
+
+	//! Move a scan state's pruning counters into the global totals
+	void DrainPruningCounters(ParquetPruningCounters &counters) {
+		if (!counters.Any()) {
+			return;
+		}
+		row_groups_pruned_stats += counters.row_groups_pruned_stats;
+		row_groups_pruned_bloom += counters.row_groups_pruned_bloom;
+		pages_pruned_stats += counters.pages_pruned_stats;
+		pages_pruned_dictionary += counters.pages_pruned_dictionary;
+		pages_pruned_bytes += counters.pages_pruned_bytes;
+		pages_pruned_after_fetch += counters.pages_pruned_after_fetch;
+		pages_pruned_after_fetch_bytes += counters.pages_pruned_after_fetch_bytes;
+		counters.Reset();
+	}
 };
 
 struct ParquetReadLocalState : public LocalTableFunctionState {
